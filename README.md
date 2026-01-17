@@ -89,14 +89,13 @@ sudo dnf install -y mesa-libEGL-devel mesa-libGL-devel libXcursor-devel libXrand
 #### Сама сборка
 
 ```
-  go mod tidy
-  go build -o screenpen-go
+./build-linux.sh
 ```
 
 
 
 Запуск с логами
 ```
-  ANNOTATOR_DEBUG=1 ./annotator
+  ANNOTATOR_DEBUG=1 ./screenpen-go
 ```
 
