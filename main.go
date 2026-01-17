@@ -4,295 +4,259 @@ import (
 	"image"
 	"image/color"
 	"log"
+	"math"
 	"os"
 	"runtime"
+	"time"
 
 	"gioui.org/app"
 	"gioui.org/f32"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
-	"gioui.org/io/system"
+	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 )
 
 type Stroke struct {
-	Col   color.NRGBA
-	Width float32
 	Pts   []f32.Point
+	Col   color.NRGBA
+	Width float32 // px
 }
 
 type Annotator struct {
 	keyTag struct{}
 	ptrTag struct{}
 
-	debug bool
-
-	hasFocus bool
-
-	curColor color.NRGBA
-	width    float32
-	dim      bool
-
 	strokes []Stroke
-	active  *Stroke
+	cur     *Stroke
+
+	col       color.NRGBA
+	widthDp   float32
+	dim       bool
+	debug     bool
+	lastLogAt time.Time
+
+	x11Ready bool
 }
 
 func main() {
-	debug := os.Getenv("ANNOTATOR_DEBUG") != ""
-
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("starting gio-annotator (go=%s, os=%s/%s)", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	log.Printf("env: XDG_SESSION_TYPE=%q WAYLAND_DISPLAY=%q DISPLAY=%q ANNOTATOR_DEBUG=%t",
-		os.Getenv("XDG_SESSION_TYPE"), os.Getenv("WAYLAND_DISPLAY"), os.Getenv("DISPLAY"), debug)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	debug := os.Getenv("ANNOTATOR_DEBUG") == "1" || os.Getenv("ANNOTATOR_DEBUG") == "true"
+	log.Printf("starting gio-screenpen (go=%s os=%s debug=%v)", runtime.Version(), runtime.GOOS+"/"+runtime.GOARCH, debug)
 
 	go func() {
 		w := new(app.Window)
 		w.Option(
-			app.Size(900, 600),
-			app.Title("gio-annotator"),
+			app.Title("gio-screenpen"),
+			app.Decorated(false),
+			app.Fullscreen.Option(),
 		)
-		if err := run(w, debug); err != nil {
-			log.Println(err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}()
 
+		a := &Annotator{
+			col:     color.NRGBA{R: 255, A: 255}, // red default
+			widthDp: 6,
+			debug:   debug,
+		}
+
+		var ops op.Ops
+		for {
+			switch e := w.Event().(type) {
+			case app.DestroyEvent:
+				log.Printf("destroy: %v", e.Err)
+				return
+			case app.X11ViewEvent:
+				if !a.x11Ready && e.Valid() {
+					if err := x11MoveWindowToPointer(e.Display, e.Window); err != nil {
+						if a.debug {
+							log.Printf("x11 move-to-pointer failed: %v", err)
+						}
+					} else if a.debug {
+						log.Printf("x11 moved window to pointer monitor (win=0x%x)", e.Window)
+					}
+					a.x11Ready = true
+				}
+			case app.FrameEvent:
+				gtx := app.NewContext(&ops, e)
+				a.frame(gtx)
+				e.Frame(gtx.Ops)
+			}
+		}
+	}()
 	app.Main()
 }
 
-func run(w *app.Window, debug bool) error {
-	a := &Annotator{
-		debug:    debug,
-		curColor: color.NRGBA{R: 0xFF, G: 0x00, B: 0x00, A: 0xFF},
-		width:    6,
-	}
-
-	var ops op.Ops
-	var frameN uint64
-
-	for {
-		evt := w.Event()
-		switch e := evt.(type) {
-		case app.DestroyEvent:
-			return e.Err
-		case app.FrameEvent:
-			frameN++
-			if frameN == 1 {
-				log.Printf("first frame: size=%v, metric=%+v", e.Size, e.Metric)
-				log.Printf("tip: click inside the window to focus it, then try keys: r/g/b/y/o/p/x, 1/2/3, c, a, esc")
-			}
-
-			keys, ptrs := a.handleInput(w, e)
-			if a.debug && (keys > 0 || ptrs > 0) {
-				log.Printf("frame=%d processed: key=%d pointer=%d focus=%v", frameN, keys, ptrs, a.hasFocus)
-			}
-
-			ops.Reset()
-			a.layout(&ops, e)
-			e.Frame(&ops)
-		}
-	}
-}
-
-func (a *Annotator) dlog(format string, args ...any) {
-	if !a.debug {
-		return
-	}
-	log.Printf(format, args...)
-}
-
-func (a *Annotator) handleInput(w *app.Window, e app.FrameEvent) (keys, pointers int) {
-
-	// Keyboard events.
-	for {
-		ev, ok := e.Source.Event(
-			key.FocusFilter{Target: &a.keyTag},
-			key.Filter{Focus: &a.keyTag, Name: key.NameEscape},
-			key.Filter{Focus: &a.keyTag, Name: "R"},
-			key.Filter{Focus: &a.keyTag, Name: "G"},
-			key.Filter{Focus: &a.keyTag, Name: "B"},
-			key.Filter{Focus: &a.keyTag, Name: "Y"},
-			key.Filter{Focus: &a.keyTag, Name: "O"},
-			key.Filter{Focus: &a.keyTag, Name: "P"},
-			key.Filter{Focus: &a.keyTag, Name: "X"},
-			key.Filter{Focus: &a.keyTag, Name: "K"},
-			key.Filter{Focus: &a.keyTag, Name: "W"},
-			key.Filter{Focus: &a.keyTag, Name: "A"},
-			key.Filter{Focus: &a.keyTag, Name: "C"},
-			key.Filter{Focus: &a.keyTag, Name: "1"},
-			key.Filter{Focus: &a.keyTag, Name: "2"},
-			key.Filter{Focus: &a.keyTag, Name: "3"},
-			key.Filter{Focus: &a.keyTag, Name: ""},
-		)
-		if !ok {
-			break
-		}
-		switch kev := ev.(type) {
-		case key.FocusEvent:
-			a.hasFocus = kev.Focus
-			a.dlog("focus: %v", kev.Focus)
-		case key.Event:
-			// We only handle key presses.
-			if kev.State != key.Press {
-				continue
-			}
-			keys++
-			a.dlog("key: name=%q mods=%v", kev.Name, kev.Modifiers)
-
-			switch kev.Name {
-			case key.NameEscape:
-				w.Perform(system.ActionClose)
-			case "R":
-				a.curColor = color.NRGBA{R: 0xFF, G: 0x00, B: 0x00, A: 0xFF}
-				log.Printf("color=red")
-			case "G":
-				a.curColor = color.NRGBA{R: 0x00, G: 0xFF, B: 0x00, A: 0xFF}
-				log.Printf("color=green")
-			case "B":
-				a.curColor = color.NRGBA{R: 0x00, G: 0x80, B: 0xFF, A: 0xFF}
-				log.Printf("color=blue")
-			case "Y":
-				a.curColor = color.NRGBA{R: 0xFF, G: 0xEB, B: 0x3B, A: 0xFF}
-				log.Printf("color=yellow")
-			case "O":
-				a.curColor = color.NRGBA{R: 0xFF, G: 0x98, B: 0x00, A: 0xFF}
-				log.Printf("color=orange")
-			case "P":
-				a.curColor = color.NRGBA{R: 0xFF, G: 0x40, B: 0xA0, A: 0xFF}
-				log.Printf("color=pink")
-			case "X":
-				// "Blur" pen: draw wide and semi-transparent.
-				a.curColor = color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0x40}
-				a.width = 20
-				log.Printf("pen=blur (alpha=%d width=%.0f)", a.curColor.A, a.width)
-			case "K":
-				a.curColor = color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0xFF}
-				log.Printf("color=black")
-			case "W":
-				a.curColor = color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF}
-				log.Printf("color=white")
-
-			case "1":
-				a.width = 2
-				log.Printf("width=2")
-			case "2":
-				a.width = 6
-				log.Printf("width=6")
-			case "3":
-				a.width = 12
-				log.Printf("width=12")
-
-			case "A":
-				a.dim = !a.dim
-				log.Printf("dim=%v", a.dim)
-			case "C":
-				a.strokes = nil
-				a.active = nil
-				log.Printf("clear")
-			}
-		}
-	}
-
-	// Pointer events.
-	for {
-		ev, ok := e.Source.Event(pointer.Filter{Target: &a.ptrTag, Kinds: pointer.Press | pointer.Drag | pointer.Release | pointer.Cancel})
-		if !ok {
-			break
-		}
-		pe, ok := ev.(pointer.Event)
-		if !ok {
-			continue
-		}
-		pointers++
-		a.dlog("pointer: kind=%v pos=(%.1f,%.1f) buttons=%v", pe.Kind, pe.Position.X, pe.Position.Y, pe.Buttons)
-
-		// Only primary button draws.
-		if pe.Buttons != 0 && !pe.Buttons.Contain(pointer.ButtonPrimary) {
-			continue
-		}
-
-		switch pe.Kind {
-		case pointer.Press:
-			// Click-to-focus: request focus when the user interacts.
-
-			st := &Stroke{
-				Col:   a.curColor,
-				Width: a.width,
-				Pts:   []f32.Point{pe.Position},
-			}
-			a.active = st
-			log.Printf("stroke begin: col=%v width=%.1f", st.Col, st.Width)
-		case pointer.Drag:
-			if a.active != nil {
-				pts := &a.active.Pts
-				last := (*pts)[len(*pts)-1]
-				dx := pe.Position.X - last.X
-				dy := pe.Position.Y - last.Y
-				// decimate points a bit
-				if dx*dx+dy*dy >= 1.5*1.5 {
-					*pts = append(*pts, pe.Position)
-				}
-			}
-		case pointer.Release, pointer.Cancel:
-			if a.active != nil {
-				a.strokes = append(a.strokes, *a.active)
-				a.active = nil
-				log.Printf("stroke end: total=%d", len(a.strokes))
-			}
-		}
-	}
-
-	return keys, pointers
-}
-
-func (a *Annotator) layout(ops *op.Ops, e app.FrameEvent) {
-	full := image.Rectangle{Max: e.Size}
-
-	// Background.
-	paint.FillShape(ops, color.NRGBA{R: 0xF5, G: 0xF5, B: 0xF5, A: 0xFF}, clip.Rect(full).Op())
-
-	// Declare a full-window hit area and attach tags.
-	area := clip.Rect(full).Push(ops)
-	event.Op(ops, &a.ptrTag)
-	event.Op(ops, &a.keyTag)
-	// Ask Gio to route keyboard events to this tag.
-	key.InputHintOp{Tag: &a.keyTag, Hint: key.HintAny}.Add(ops)
-	// Request focus after the tag is in the input tree for this frame.
-	if !a.hasFocus {
-		e.Source.Execute(key.FocusCmd{Tag: &a.keyTag})
-	}
+func (a *Annotator) frame(gtx layout.Context) {
+	// Pointer events should be scoped to the window rect.
+	area := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
+	event.Op(gtx.Ops, &a.ptrTag)
 	area.Pop()
 
-	// Optional dim overlay.
+	// Keyboard focus/events.
+	event.Op(gtx.Ops, &a.keyTag)
+	key.InputHintOp{Tag: &a.keyTag, Hint: key.HintAny}.Add(gtx.Ops)
+	gtx.Execute(key.FocusCmd{Tag: &a.keyTag})
+
+	a.handlePointer(gtx)
+	a.handleKeys(gtx)
+
+	// Background.
+	paint.FillShape(gtx.Ops, color.NRGBA{R: 245, G: 245, B: 245, A: 255}, clip.Rect{Max: gtx.Constraints.Max}.Op())
 	if a.dim {
-		paint.FillShape(ops, color.NRGBA{A: 120}, clip.Rect(full).Op())
+		paint.FillShape(gtx.Ops, color.NRGBA{A: 120}, clip.Rect{Max: gtx.Constraints.Max}.Op())
 	}
 
+	// Draw strokes.
 	for i := range a.strokes {
-		drawStroke(ops, a.strokes[i])
+		drawStroke(gtx.Ops, &a.strokes[i])
 	}
-	if a.active != nil {
-		drawStroke(ops, *a.active)
-		// Keep animating while drawing.
-		e.Source.Execute(op.InvalidateCmd{})
+	if a.cur != nil {
+		drawStroke(gtx.Ops, a.cur)
 	}
 }
 
-func drawStroke(ops *op.Ops, s Stroke) {
-	if len(s.Pts) < 2 {
+func (a *Annotator) handlePointer(gtx layout.Context) {
+	for {
+		ev, ok := gtx.Event(pointer.Filter{
+			Target: &a.ptrTag,
+			Kinds:  pointer.Press | pointer.Drag | pointer.Release | pointer.Cancel,
+		})
+		if !ok {
+			break
+		}
+		pe := ev.(pointer.Event)
+		if a.debug && time.Since(a.lastLogAt) > 150*time.Millisecond {
+			log.Printf("pointer: kind=%v pos=(%.1f,%.1f) buttons=%v", pe.Kind, pe.Position.X, pe.Position.Y, pe.Buttons)
+			a.lastLogAt = time.Now()
+		}
+		switch pe.Kind {
+		case pointer.Press:
+			if pe.Buttons&pointer.ButtonPrimary == 0 {
+				continue
+			}
+			a.cur = &Stroke{Col: a.col, Width: dpToPx(gtx, a.widthDp)}
+			a.cur.Pts = append(a.cur.Pts, pe.Position)
+		case pointer.Drag:
+			if a.cur == nil {
+				continue
+			}
+			// Interpolate points so the line looks continuous (not dotted).
+			last := a.cur.Pts[len(a.cur.Pts)-1]
+			appendInterpolated(&a.cur.Pts, last, pe.Position, a.cur.Width/2)
+		case pointer.Release, pointer.Cancel:
+			if a.cur != nil {
+				a.strokes = append(a.strokes, *a.cur)
+				a.cur = nil
+			}
+		}
+	}
+
+	// Keep animating while drawing.
+	if a.cur != nil {
+		gtx.Execute(op.InvalidateCmd{})
+	}
+}
+
+func (a *Annotator) handleKeys(gtx layout.Context) {
+	// Log focus changes (and enable IME hints).
+	for {
+		ev, ok := gtx.Event(key.FocusFilter{Target: &a.keyTag})
+		if !ok {
+			break
+		}
+		if fe, ok := ev.(key.FocusEvent); ok && a.debug {
+			log.Printf("key focus: %v", fe.Focus)
+		}
+	}
+
+	for {
+		ev, ok := gtx.Event(key.Filter{Focus: &a.keyTag, Name: ""})
+		if !ok {
+			break
+		}
+		ke := ev.(key.Event)
+		if ke.State != key.Press {
+			continue
+		}
+		if a.debug {
+			log.Printf("key: name=%q mods=%v", ke.Name, ke.Modifiers)
+		}
+		switch ke.Name {
+		case "R":
+			a.col = color.NRGBA{R: 255, A: 255}
+		case "G":
+			a.col = color.NRGBA{G: 255, A: 255}
+		case "B":
+			a.col = color.NRGBA{B: 255, A: 255}
+		case "Y":
+			a.col = color.NRGBA{R: 255, G: 255, A: 255}
+		case "O":
+			a.col = color.NRGBA{R: 255, G: 165, A: 255}
+		case "P":
+			a.col = color.NRGBA{R: 255, G: 105, B: 180, A: 255}
+		case "X":
+			// "Blur" pen: wide semi-transparent black.
+			a.col = color.NRGBA{A: 0x40}
+			a.widthDp = 20
+		case "1":
+			a.widthDp = 3
+		case "2":
+			a.widthDp = 6
+		case "3":
+			a.widthDp = 12
+		case "A":
+			a.dim = !a.dim
+		case "C":
+			a.strokes = nil
+			a.cur = nil
+		case key.NameEscape:
+			os.Exit(0)
+		}
+		gtx.Execute(op.InvalidateCmd{})
+	}
+}
+
+
+
+func dpToPx(gtx layout.Context, dp float32) float32 {
+	return float32(gtx.Metric.PxPerDp) * dp
+}
+
+func appendInterpolated(dst *[]f32.Point, a, b f32.Point, spacing float32) {
+	if spacing <= 1 {
+		*dst = append(*dst, b)
 		return
 	}
-	var p clip.Path
-	p.Begin(ops)
-	p.MoveTo(s.Pts[0])
-	for _, pt := range s.Pts[1:] {
-		p.LineTo(pt)
+	dx := float64(b.X - a.X)
+	dy := float64(b.Y - a.Y)
+	d := math.Hypot(dx, dy)
+	if d == 0 {
+		return
 	}
-	path := p.End()
-	shape := clip.Stroke{Path: path, Width: s.Width}.Op()
-	paint.FillShape(ops, s.Col, shape)
+	steps := int(d / float64(spacing))
+	if steps < 1 {
+		*dst = append(*dst, b)
+		return
+	}
+	for i := 1; i <= steps; i++ {
+		t := float64(i) / float64(steps)
+		p := f32.Point{
+			X: float32(float64(a.X) + dx*t),
+			Y: float32(float64(a.Y) + dy*t),
+		}
+		*dst = append(*dst, p)
+	}
+}
+
+func drawStroke(ops *op.Ops, s *Stroke) {
+	if len(s.Pts) == 0 {
+		return
+	}
+	r := int(math.Max(1, float64(s.Width/2)))
+	for _, p := range s.Pts {
+		rect := image.Rect(int(p.X)-r, int(p.Y)-r, int(p.X)+r, int(p.Y)+r)
+		paint.FillShape(ops, s.Col, clip.Ellipse(rect).Op(ops))
+	}
 }
